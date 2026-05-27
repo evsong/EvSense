@@ -261,3 +261,11 @@ v2/crates/rvcsi-node/*.node
 v2/crates/rvcsi-node/binding.js
 v2/crates/rvcsi-node/binding.d.ts
 v2/crates/rvcsi-node/npm/
+
+# EvSense fork — local-only artifacts
+.memsearch/
+**/.memsearch/
+**/nvs_provision*.bin
+**/nvs_n*.bin
+**/nvs_idf.bin
+*.local.env
