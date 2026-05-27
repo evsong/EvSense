@@ -501,4 +501,118 @@ mod tests {
             "Lost track must remain in tracker for re-identification window"
         );
     }
+
+    /// Helper: among `results`, return the id of the person whose nose-x is
+    /// closest to `target_x`. Used by multi-person tests where the tracker
+    /// may reorder output relative to input.
+    fn id_at_x(results: &[PersonDetection], target_x: f64) -> u32 {
+        results
+            .iter()
+            .min_by(|a, b| {
+                let dx = |p: &PersonDetection| {
+                    p.keypoints
+                        .iter()
+                        .find(|k| k.name == "nose")
+                        .map(|k| (k.x - target_x).abs())
+                        .unwrap_or(f64::MAX)
+                };
+                dx(a).partial_cmp(&dx(b)).unwrap()
+            })
+            .map(|p| p.id)
+            .expect("at least one person in results")
+    }
+
+    fn person_at(x: f64) -> PersonDetection {
+        make_person(
+            0,
+            vec![
+                make_keypoint("nose", x, 2.0, 0.0),
+                make_keypoint("left_shoulder", x - 0.2, 2.5, 0.0),
+                make_keypoint("right_shoulder", x + 0.2, 2.5, 0.0),
+                make_keypoint("left_hip", x - 0.1, 3.5, 0.0),
+                make_keypoint("right_hip", x + 0.1, 3.5, 0.0),
+            ],
+        )
+    }
+
+    /// Two well-separated persons must get distinct, stable track IDs across
+    /// frames — the frontend keys its A/B/C/D figure pool on these IDs, and an
+    /// ID swap would visibly relabel the wrong person.
+    #[test]
+    fn test_two_persons_keep_distinct_ids() {
+        let mut tracker = PoseTracker::new();
+        let mut last_instant: Option<Instant> = None;
+
+        let a = person_at(1.0);
+        let b = person_at(5.0);
+
+        let r1 = tracker_update(&mut tracker, &mut last_instant, vec![a.clone(), b.clone()]);
+        assert_eq!(r1.len(), 2, "both persons must be tracked from frame 1");
+        let id_a = id_at_x(&r1, 1.0);
+        let id_b = id_at_x(&r1, 5.0);
+        assert_ne!(id_a, id_b, "distinct persons must get distinct track IDs");
+
+        for frame in 2..=6 {
+            let r = tracker_update(&mut tracker, &mut last_instant, vec![a.clone(), b.clone()]);
+            assert_eq!(r.len(), 2, "frame {frame}: both persons still tracked");
+            assert_eq!(id_at_x(&r, 1.0), id_a, "frame {frame}: person A id stable");
+            assert_eq!(id_at_x(&r, 5.0), id_b, "frame {frame}: person B id stable");
+        }
+    }
+
+    /// Re-ID guarantee: when a person briefly disappears (track goes Lost)
+    /// and returns at the same position within `reid_window`, the bridge
+    /// must revive the existing track rather than minting a new ID.
+    /// Without this, the UI's per-person label/color would flicker every time
+    /// the sensing pipeline drops a few frames.
+    #[test]
+    fn test_track_id_reused_after_brief_disappearance() {
+        use wifi_densepose_signal::ruvsense::TrackLifecycleState;
+
+        let mut tracker = PoseTracker::new();
+        let mut last_instant: Option<Instant> = None;
+        let p = person_at(1.0);
+
+        // Establish an Active track (≥2 consecutive hits).
+        let _ = tracker_update(&mut tracker, &mut last_instant, vec![p.clone()]);
+        let r2 = tracker_update(&mut tracker, &mut last_instant, vec![p.clone()]);
+        let original_id = r2[0].id;
+
+        // Drop the track to Lost by feeding empty detections past loss_misses=5.
+        for _ in 0..7 {
+            let _ = tracker_update(&mut tracker, &mut last_instant, vec![]);
+        }
+        assert!(
+            tracker
+                .all_tracks()
+                .iter()
+                .any(|t| t.lifecycle == TrackLifecycleState::Lost),
+            "setup: track should be Lost (not Terminated) before re-appearance"
+        );
+
+        // Person returns. The bridge should match the Lost track and revive it,
+        // returning the same id — not create a new track.
+        let r_back = tracker_update(&mut tracker, &mut last_instant, vec![p.clone()]);
+        assert_eq!(r_back.len(), 1, "track must come back when person returns");
+        assert_eq!(
+            r_back[0].id, original_id,
+            "re-ID must reuse the same track ID after brief disappearance \
+             (frontend per-person color/label depends on this)"
+        );
+    }
+
+    /// Contract test: the JSON shipped over `/ws/sensing` must include the
+    /// `id` field by that exact name. The frontend's per-person figure pool
+    /// keys on `person.id` (see ui-v2-mockup/observatory-cn/observatory/js/
+    /// figure-pool.js); renaming this field server-side would silently
+    /// break A/B/C/D labeling.
+    #[test]
+    fn test_person_detection_serializes_id_field() {
+        let person = make_person(42, vec![make_keypoint("nose", 1.0, 2.0, 0.0)]);
+        let json = serde_json::to_string(&person).expect("PersonDetection must serialize");
+        assert!(
+            json.contains("\"id\":42"),
+            "expected `\"id\":42` in serialized JSON, got: {json}"
+        );
+    }
 }
