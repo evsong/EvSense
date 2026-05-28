@@ -696,3 +696,46 @@ body {
   #key-hints { display: none; }
   .settings-dialog { width: 95vw; }
 }
+
+/* ---- CSS2D Person Labels (A/B/C/D head tags) ---- */
+/* The labels-overlay div is appended by CSS2DRenderer in main.js. It must
+   sit above the WebGL canvas but never intercept pointer events so OrbitControls
+   keeps working. */
+#labels-overlay {
+  pointer-events: none;
+  user-select: none;
+}
+
+.person-label {
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 4px 10px 5px;
+  background: rgba(8, 12, 20, 0.78);
+  border: 1px solid #00d878;            /* overridden per-id from JS */
+  border-radius: 6px;
+  font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif;
+  color: #d8e0f0;
+  text-align: center;
+  box-shadow: 0 0 12px rgba(0, 0, 0, 0.5);
+  /* CSS2DRenderer positions the element at the world point, so we offset
+     it upward and centered to sit just above the head. */
+  transform: translate(-50%, -100%) translateY(-6px);
+  white-space: nowrap;
+}
+
+.person-label__letter {
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.04em;
+  color: #00d878;                       /* overridden per-id from JS */
+}
+
+.person-label__pose {
+  font-size: 11px;
+  opacity: 0.85;
+  line-height: 1.1;
+}

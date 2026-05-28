@@ -141,6 +141,33 @@ const CHEST_JOINTS = new Set([5, 6, 11, 12]);
 const STATE_COLOR_RED   = 0xff3040; // critical: fallen / HR > 140
 const STATE_COLOR_AMBER = 0xffb020; // warning:  HR > 110 / abnormal BR
 
+// Per-id base palette for multi-person disambiguation (A/B/C/D figures
+// get visually distinct cloud colors). Cycled by `id % PERSON_COLORS.length`.
+// State tint (red / amber) still overrides this when triggered.
+const PERSON_COLORS = [
+  0x00d878,  // EvSense green
+  0x40a0ff,  // sky blue
+  0xff9020,  // amber
+  0xc060ff,  // violet
+  0x40ffc0,  // mint
+  0xff5080,  // hot pink
+  0xffff60,  // yellow
+  0x60d0ff,  // ice
+];
+
+/**
+ * Stable color for a person id. Same id always returns the same hue, so a
+ * track that briefly disappears (re-ID via tracker_bridge) keeps its color.
+ */
+export function colorForPersonId(personId, out) {
+  return out.setHex(PERSON_COLORS[(personId >>> 0) % PERSON_COLORS.length]);
+}
+
+// Time-to-release for an id's pool slot reservation after the person stops
+// being reported. Long enough to absorb a few dropped frames + tracker_bridge
+// re-ID, short enough that pool capacity recycles for actually-new people.
+const STALE_SECONDS = 2.0;
+
 /**
  * Resolve the effective particle color for a person from pose + vitals.
  * Writes into `out` (a THREE.Color) and returns it.
@@ -198,11 +225,79 @@ export class FigurePool {
     this._poseSystem = poseSystem;
     this._figures = [];
     this._maxFigures = MAX_FIGURES;
+    // Stable mapping from server-side track id -> pool slot index. A track
+    // that briefly disappears keeps its slot reservation for STALE_SECONDS
+    // so re-IDs preserve color, label letter, and figure animation state.
+    this._byId = new Map();
+    this._lastSeenAt = new Map();
     this._build();
   }
 
-  /** @returns {Array} The array of figure objects */
+  /** @returns {Array} The array of figure objects (pool order, not id order). */
   get figures() { return this._figures; }
+
+  /** True iff `personId` currently has an assigned pool slot. */
+  hasPerson(personId) {
+    return this._byId.has(personId);
+  }
+
+  /**
+   * Iterate currently-assigned slots as [personId, figure] pairs. Yields
+   * even slots whose figure is hidden this frame (within STALE_SECONDS).
+   */
+  *activeAssignments() {
+    for (const [id, slot] of this._byId) {
+      yield [id, this._figures[slot]];
+    }
+  }
+
+  /** Per-id color (writes into `out`, returns it). */
+  getPersonColor(personId, out) {
+    return colorForPersonId(personId, out);
+  }
+
+  /**
+   * Write the world-space head position (just above the nose joint) for
+   * `personId` into `out` (THREE.Vector3). Returns true if found and the
+   * figure is currently visible, false otherwise.
+   */
+  getHeadWorldPosition(personId, out) {
+    const slot = this._byId.get(personId);
+    if (slot === undefined) return false;
+    const fig = this._figures[slot];
+    if (!fig.visible) return false;
+    fig.joints[0].getWorldPosition(out);
+    out.y += 0.25;
+    return true;
+  }
+
+  /**
+   * Pick a free pool slot, or evict the stalest assignment whose last-seen
+   * time is older than STALE_SECONDS. Returns undefined if the pool is full
+   * AND every assignment is still fresh.
+   */
+  _allocateSlot(now) {
+    for (let i = 0; i < this._figures.length; i++) {
+      if (this._figures[i]._personId === null) return i;
+    }
+    let stalestId = null;
+    let stalestT = Infinity;
+    for (const [id, t] of this._lastSeenAt) {
+      if (t < stalestT) { stalestT = t; stalestId = id; }
+    }
+    if (stalestId !== null && now - stalestT > STALE_SECONDS) {
+      const slot = this._byId.get(stalestId);
+      this._byId.delete(stalestId);
+      this._lastSeenAt.delete(stalestId);
+      if (slot !== undefined) {
+        const fig = this._figures[slot];
+        fig._personId = null;
+        if (fig.visible) { this.hide(fig); fig.visible = false; }
+        return slot;
+      }
+    }
+    return undefined;
+  }
 
   // ---- Construction ----
 
@@ -355,6 +450,9 @@ export class FigurePool {
       // moment a fall is detected.
       _scatterBurst: 0,
       _tintScratch: tintScratch,
+      // Server-side track id currently occupying this slot. Set by
+      // update() when assigning; null while the slot is free.
+      _personId: null,
     };
   }
 
@@ -419,7 +517,8 @@ export class FigurePool {
    * @param {number} elapsed - Elapsed time in seconds
    */
   update(data, elapsed) {
-    const persons = data?.persons || [];
+    const allPersons = data?.persons || [];
+    const persons = allPersons.slice(0, this._maxFigures);
     const vs = data?.vital_signs || {};
     const isPresent = data?.classification?.presence || false;
     const breathBpm = vs.breathing_rate_bpm || 0;
@@ -432,20 +531,49 @@ export class FigurePool {
       ? Math.sin(elapsed * Math.PI * 2 * (hrBpm / 60))
       : 0;
 
-    for (let f = 0; f < this._figures.length; f++) {
-      const fig = this._figures[f];
-      if (f < persons.length && isPresent) {
-        const p = persons[f];
+    // Assign each person to its slot by id, allocating if first seen.
+    const usedSlots = new Set();
+    if (isPresent) {
+      for (const p of persons) {
+        if (typeof p.id !== 'number') continue;
+        const pid = p.id;
+        let slot = this._byId.get(pid);
+        if (slot === undefined) {
+          slot = this._allocateSlot(elapsed);
+          if (slot === undefined) continue; // pool full of fresh assignments
+          this._byId.set(pid, slot);
+          this._figures[slot]._personId = pid;
+        }
+        this._lastSeenAt.set(pid, elapsed);
+        usedSlots.add(slot);
+
+        const fig = this._figures[slot];
         const kps = this._poseSystem.generateKeypoints(p, elapsed, breathPulse);
         this.applyKeypoints(
-          fig, kps, breathPulse, p.position || [0, 0, 0], elapsed, p.pose, vs, hrPulse,
+          fig, kps, breathPulse, p.position || [0, 0, 0], elapsed, p.pose, vs, hrPulse, pid,
         );
         fig.visible = true;
-      } else {
-        if (fig.visible) {
-          this.hide(fig);
-          fig.visible = false;
-        }
+      }
+    }
+
+    // Hide any slot that didn't receive a person this frame. Note we keep
+    // the _personId reservation alive until STALE_SECONDS elapses below,
+    // so a re-IDed person within the window reuses the same slot+color.
+    for (let f = 0; f < this._figures.length; f++) {
+      const fig = this._figures[f];
+      if (!usedSlots.has(f) && fig.visible) {
+        this.hide(fig);
+        fig.visible = false;
+      }
+    }
+
+    // GC stale id reservations.
+    for (const [id, lastSeen] of this._lastSeenAt) {
+      if (elapsed - lastSeen > STALE_SECONDS) {
+        const slot = this._byId.get(id);
+        if (slot !== undefined) this._figures[slot]._personId = null;
+        this._byId.delete(id);
+        this._lastSeenAt.delete(id);
       }
     }
   }
@@ -459,7 +587,7 @@ export class FigurePool {
    * @param {number} elapsed - Elapsed time for pulsation effects
    * @param {string} pose - Current pose name for aura adaptation
    */
-  applyKeypoints(fig, kps, breathPulse, pos, elapsed = 0, pose = 'standing', vitals = null, hrPulse = 0) {
+  applyKeypoints(fig, kps, breathPulse, pos, elapsed = 0, pose = 'standing', vitals = null, hrPulse = 0, personId = null) {
     const lerpFactor = fig._initialized ? 0.18 : 1.0;
 
     // Fall transition: arm the scatter burst exactly when the pose first
@@ -470,14 +598,16 @@ export class FigurePool {
       fig._scatterBurst = 1.0;
     }
 
-    // State tint (red / amber / base) — overrides the user's chosen
-    // wireColor for the particle cloud only, leaving joints/bones in the
-    // theme color so the alert reads as "the *cloud* is in alert state".
-    const baseColor = fig.particleMat.color; // current color is the safe fallback
-    // We need the base wireColor independently of any prior tint we wrote.
-    // Read it fresh from settings each frame so color picker changes apply.
-    const settingsBase = (this._settingsBaseColor ||= new THREE.Color())
-      .set(this._settings.wireColor);
+    // Particle base color = per-id hash (so A/B/C/D figures read as
+    // distinct people) or the theme wireColor when no id is supplied.
+    // State tint (red / amber) overrides both when triggered.
+    const baseColor = fig.particleMat.color;
+    const settingsBase = (this._settingsBaseColor ||= new THREE.Color());
+    if (personId !== null) {
+      colorForPersonId(personId, settingsBase);
+    } else {
+      settingsBase.set(this._settings.wireColor);
+    }
     _stateTintColor(vitals, pose, settingsBase, fig._tintScratch);
     baseColor.copy(fig._tintScratch);
 

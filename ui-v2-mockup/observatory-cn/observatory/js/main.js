@@ -10,6 +10,7 @@
  */
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { CSS2DRenderer } from 'three/addons/renderers/CSS2DRenderer.js';
 
 import { DemoDataGenerator } from './demo-data.js';
 import { NebulaBackground } from './nebula-background.js';
@@ -17,6 +18,7 @@ import { PostProcessing } from './post-processing.js';
 import { FigurePool, SKELETON_PAIRS } from './figure-pool.js';
 import { PoseSystem } from './pose-system.js';
 import { ScenarioProps } from './scenario-props.js';
+import { PersonLabels } from './person-labels.js';
 import { HudController, DEFAULTS, SETTINGS_VERSION, PRESETS, SCENARIO_NAMES } from './hud-controller.js';
 
 // ---- Palette ----
@@ -120,6 +122,20 @@ class Observatory {
     // Post-processing
     this._postProcessing = new PostProcessing(this._renderer, this._scene, this._camera);
     this._applyPostSettings();
+
+    // CSS2D overlay for per-person A/B/C/D head labels. Lives in its own
+    // DOM layer above the WebGL canvas; pointer-events: none so clicks
+    // pass through to OrbitControls.
+    this._labelsRenderer = new CSS2DRenderer();
+    this._labelsRenderer.setSize(window.innerWidth, window.innerHeight);
+    const labelsEl = this._labelsRenderer.domElement;
+    labelsEl.id = 'labels-overlay';
+    labelsEl.style.position = 'absolute';
+    labelsEl.style.top = '0';
+    labelsEl.style.left = '0';
+    labelsEl.style.pointerEvents = 'none';
+    document.body.appendChild(labelsEl);
+    this._personLabels = new PersonLabels(this._scene, this._figurePool);
 
     // HUD controller (settings dialog, sparkline, vital displays)
     this._hud = new HudController(this);
@@ -601,6 +617,11 @@ class Observatory {
     this._controls.update();
     this._postProcessing.update(elapsed);
     this._postProcessing.render();
+    // CSS2D label overlay: sync to current persons (FigurePool is the
+    // source of truth for id->slot mapping), then render to the DOM layer.
+    // Done after post-processing so labels sit on top of bloom.
+    if (this._personLabels) this._personLabels.sync(data);
+    if (this._labelsRenderer) this._labelsRenderer.render(this._scene, this._camera);
     this._updateFPS(dt);
   }
 
@@ -767,6 +788,7 @@ class Observatory {
     this._camera.updateProjectionMatrix();
     this._renderer.setSize(w, h);
     this._postProcessing.resize(w, h);
+    if (this._labelsRenderer) this._labelsRenderer.setSize(w, h);
   }
 }
 
