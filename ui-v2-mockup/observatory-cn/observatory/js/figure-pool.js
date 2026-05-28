@@ -158,9 +158,52 @@ const PERSON_COLORS = [
 /**
  * Stable color for a person id. Same id always returns the same hue, so a
  * track that briefly disappears (re-ID via tracker_bridge) keeps its color.
+ * Accepts numeric ids (from the production WS payload) and string ids (used
+ * by the demo data generator) — strings are reduced to an int via a cheap
+ * FNV-1a so both code paths share the palette.
  */
 export function colorForPersonId(personId, out) {
-  return out.setHex(PERSON_COLORS[(personId >>> 0) % PERSON_COLORS.length]);
+  let idx;
+  if (typeof personId === 'number') {
+    idx = (personId >>> 0) % PERSON_COLORS.length;
+  } else {
+    const s = String(personId);
+    let h = 0x811c9dc5;
+    for (let i = 0; i < s.length; i++) {
+      h = (h ^ s.charCodeAt(i)) >>> 0;
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    idx = h % PERSON_COLORS.length;
+  }
+  return out.setHex(PERSON_COLORS[idx]);
+}
+
+// Arousal ring color endpoints. Lerped by arousal in [0,1].
+const AROUSAL_COLD = new THREE.Color(0x40a0ff);
+const AROUSAL_WARM = new THREE.Color(0xff5060);
+
+/**
+ * Experimental arousal estimate in [0,1] from per-person motion + global
+ * vitals. The HR/BR terms only kick in past a baseline (HR=70, BR=15)
+ * because resting vitals shouldn't lift arousal off the floor.
+ *
+ * NOT a clinical metric. Shown with an "实验" tag in the HUD.
+ */
+export function estimateArousal(motionScore, vitals) {
+  const m = Math.max(0, Math.min(1, motionScore || 0));
+  let hrTerm = 0;
+  let brTerm = 0;
+  if (vitals) {
+    const hr = vitals.heart_rate_bpm;
+    if (typeof hr === 'number' && hr > 70) {
+      hrTerm = Math.min(1, (hr - 70) / 40);
+    }
+    const br = vitals.breathing_rate_bpm;
+    if (typeof br === 'number' && br > 15) {
+      brTerm = Math.min(1, (br - 15) / 15);
+    }
+  }
+  return Math.max(0, Math.min(1, 0.6 * m + 0.3 * hrTerm + 0.1 * brTerm));
 }
 
 // Time-to-release for an id's pool slot reservation after the person stops
@@ -254,6 +297,13 @@ export class FigurePool {
   /** Per-id color (writes into `out`, returns it). */
   getPersonColor(personId, out) {
     return colorForPersonId(personId, out);
+  }
+
+  /** Latest smoothed arousal estimate for `personId`, or 0 if not tracked. */
+  getPersonArousal(personId) {
+    const slot = this._byId.get(personId);
+    if (slot === undefined) return 0;
+    return this._figures[slot]._arousal || 0;
   }
 
   /**
@@ -408,6 +458,21 @@ export class FigurePool {
     personLight.position.y = 1;
     group.add(personLight);
 
+    // Arousal ring — flat glowing ring at the figure's feet. Radius scales
+    // with the experimental arousal estimate (0..1) and color lerps from a
+    // cold blue toward a warm red. Diablo-style "the floor under them
+    // glows when they're agitated" cue. Marked experimental in the HUD.
+    const arousalGeo = new THREE.RingGeometry(0.32, 0.42, 32, 1);
+    const arousalMat = new THREE.MeshBasicMaterial({
+      color: 0x40a0ff,
+      transparent: true, opacity: 0,
+      side: THREE.DoubleSide, blending: THREE.AdditiveBlending, depthWrite: false,
+    });
+    const arousalRing = new THREE.Mesh(arousalGeo, arousalMat);
+    arousalRing.rotation.x = -Math.PI / 2;  // lay flat on floor
+    arousalRing.position.y = 0.02;
+    group.add(arousalRing);
+
     // ---- Particle cloud (replaces solid body capsule visually) ----
     const particleGeo = new THREE.BufferGeometry();
     const particlePos = new Float32Array(PARTICLES_TOTAL * 3);
@@ -440,6 +505,7 @@ export class FigurePool {
     return {
       group, joints, bones, bodySegments, aura, auraMat, personLight,
       particles, particleMat, particlePos,
+      arousalRing, arousalMat,
       visible: false,
       prevPositions,
       velocities,
@@ -450,6 +516,10 @@ export class FigurePool {
       // moment a fall is detected.
       _scatterBurst: 0,
       _tintScratch: tintScratch,
+      // Most recent arousal estimate in [0,1]. PersonLabels reads this
+      // to show the same number in the single-person HUD card so the
+      // ring + the readout stay in lockstep.
+      _arousal: 0,
       // Server-side track id currently occupying this slot. Set by
       // update() when assigning; null while the slot is free.
       _personId: null,
@@ -535,7 +605,9 @@ export class FigurePool {
     const usedSlots = new Set();
     if (isPresent) {
       for (const p of persons) {
-        if (typeof p.id !== 'number') continue;
+        // Accept numeric (production) and string (demo) ids; reject only
+        // null/undefined so we never mint a slot for a ghost detection.
+        if (p.id === undefined || p.id === null) continue;
         const pid = p.id;
         let slot = this._byId.get(pid);
         if (slot === undefined) {
@@ -551,6 +623,7 @@ export class FigurePool {
         const kps = this._poseSystem.generateKeypoints(p, elapsed, breathPulse);
         this.applyKeypoints(
           fig, kps, breathPulse, p.position || [0, 0, 0], elapsed, p.pose, vs, hrPulse, pid,
+          p.motion_score || 0,
         );
         fig.visible = true;
       }
@@ -587,8 +660,19 @@ export class FigurePool {
    * @param {number} elapsed - Elapsed time for pulsation effects
    * @param {string} pose - Current pose name for aura adaptation
    */
-  applyKeypoints(fig, kps, breathPulse, pos, elapsed = 0, pose = 'standing', vitals = null, hrPulse = 0, personId = null) {
+  applyKeypoints(fig, kps, breathPulse, pos, elapsed = 0, pose = 'standing', vitals = null, hrPulse = 0, personId = null, motionScore = 0) {
     const lerpFactor = fig._initialized ? 0.18 : 1.0;
+
+    // Arousal ring (experimental) — flat ring at feet, scale + color
+    // driven by estimateArousal(). Smooth-ease toward target so it
+    // breathes instead of snapping.
+    const arousalTarget = estimateArousal(motionScore, vitals);
+    fig._arousal += (arousalTarget - fig._arousal) * 0.12;
+    const a = fig._arousal;
+    fig.arousalRing.scale.set(1 + a * 1.5, 1 + a * 1.5, 1);
+    fig.arousalRing.position.set(pos[0], 0.02, pos[2]);
+    fig.arousalMat.color.copy(AROUSAL_COLD).lerp(AROUSAL_WARM, a);
+    fig.arousalMat.opacity = 0.25 + 0.45 * a;
 
     // Fall transition: arm the scatter burst exactly when the pose first
     // becomes 'fallen'/'falling'. The burst then decays inside _updateParticles.
@@ -791,6 +875,8 @@ export class FigurePool {
     fig.auraMat.opacity = 0;
     fig.personLight.intensity = 0;
     if (fig.particleMat) fig.particleMat.opacity = 0;
+    if (fig.arousalMat) fig.arousalMat.opacity = 0;
+    fig._arousal = 0;
     fig._initialized = false;
   }
 

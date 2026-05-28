@@ -739,3 +739,65 @@ body {
   opacity: 0.85;
   line-height: 1.1;
 }
+
+/* Single-person mode only — toggled to display:flex from JS. */
+.person-label__vitals {
+  display: none;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+  margin-top: 6px;
+  padding-top: 6px;
+  min-width: 110px;
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+  color: #e8ecf6;
+}
+
+.person-label__row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
+  font-size: 11px;
+}
+
+.person-label__row > span:first-child {
+  opacity: 0.7;
+}
+
+.person-label__row > b {
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.person-label__row .unit {
+  font-size: 9px;
+  opacity: 0.55;
+  margin-left: -2px;
+}
+
+.person-label__row .experimental {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 0 4px;
+  font-size: 8px;
+  font-weight: 700;
+  color: #ffb020;
+  border: 1px solid #ffb020;
+  border-radius: 3px;
+  vertical-align: super;
+  line-height: 1.4;
+  opacity: 0.9;
+}
+
+.hr-sparkline {
+  width: 80px;
+  height: 20px;
+  margin-top: 4px;
+  display: block;
+  /* stroke is set per-frame from JS to match the person's id color */
+  color: #00d878;
+  opacity: 0.9;
+}

@@ -33,6 +33,13 @@ const POSE_LABELS = {
   crouching:  '蹲',
 };
 
+// Single-person sparkline buffer: ~10s of HR samples at one sample per
+// SPARK_SAMPLE_INTERVAL_MS, drawn into a 80x20 SVG polyline.
+const SPARK_CAPACITY = 40;
+const SPARK_SAMPLE_INTERVAL_MS = 250;
+const SPARK_WIDTH = 80;
+const SPARK_HEIGHT = 20;
+
 export class PersonLabels {
   /**
    * @param {THREE.Scene} scene
@@ -42,11 +49,16 @@ export class PersonLabels {
   constructor(scene, figurePool) {
     this._scene = scene;
     this._pool = figurePool;
-    this._labels = new Map();        // personId -> {object, divEl, letterEl, poseEl}
+    this._labels = new Map();        // personId -> {object, divEl, letterEl, poseEl, vitalsEl, hrEl, brEl, arousalEl, polyEl}
     this._letterFor = new Map();     // personId -> letter
     this._usedLetters = new Set();   // currently-assigned letters
     this._headScratch = new THREE.Vector3();
     this._colorScratch = new THREE.Color();
+    // Sparkline state — single buffer that follows the currently-only
+    // visible person. Reset on transition into/out of single-person mode.
+    this._hrSeries = [];
+    this._lastSparkSampleMs = 0;
+    this._lastSparkOwner = null;
   }
 
   /**
@@ -58,21 +70,38 @@ export class PersonLabels {
   sync(data) {
     const personById = new Map();
     for (const p of (data?.persons || [])) {
-      if (typeof p.id === 'number') personById.set(p.id, p);
+      if (p.id !== undefined && p.id !== null) personById.set(p.id, p);
     }
+    const vitals = data?.vital_signs || null;
+
+    // First pass: collect visible ids so we know if we're in single-person mode.
+    const visible = [];
+    for (const [pid, fig] of this._pool.activeAssignments()) {
+      if (fig.visible) visible.push(pid);
+    }
+    const isSingle = visible.length === 1;
+    const singleId = isSingle ? visible[0] : null;
+
+    // Reset sparkline buffer if the single-person owner changed (or we
+    // left/entered single-person mode). Otherwise the new person inherits
+    // the prior person's curve, which is misleading.
+    if (singleId !== this._lastSparkOwner) {
+      this._hrSeries.length = 0;
+      this._lastSparkSampleMs = 0;
+      this._lastSparkOwner = singleId;
+    }
+    if (isSingle) this._maybeSampleHr(vitals);
 
     const seen = new Set();
 
     for (const [pid, fig] of this._pool.activeAssignments()) {
-      // Skip slots that are reserved but currently hidden (figure between
-      // frames); their label re-appears when the figure re-shows.
       if (!fig.visible) continue;
 
       seen.add(pid);
       let label = this._labels.get(pid);
       if (!label) {
         label = this._createLabel(pid);
-        if (!label) continue; // all 4 letters in use (shouldn't happen given pool cap)
+        if (!label) continue;
         this._labels.set(pid, label);
       }
 
@@ -84,6 +113,25 @@ export class PersonLabels {
       label.divEl.style.borderColor = hex;
       label.letterEl.style.color = hex;
 
+      // Single-person mode: this label gets the full HR/BR/arousal card
+      // + sparkline. Multi-person: hide the card so the head label stays
+      // small and unambiguous.
+      if (isSingle && pid === singleId) {
+        label.vitalsEl.style.display = 'flex';
+        const hr = vitals?.heart_rate_bpm;
+        const br = vitals?.breathing_rate_bpm;
+        label.hrEl.textContent = (typeof hr === 'number' && hr > 0)
+          ? Math.round(hr).toString() : '--';
+        label.brEl.textContent = (typeof br === 'number' && br > 0)
+          ? Math.round(br).toString() : '--';
+        const ar = this._pool.getPersonArousal(pid);
+        label.arousalEl.textContent = ar.toFixed(2);
+        label.polyEl.setAttribute('stroke', hex);
+        label.polyEl.setAttribute('points', this._sparkPoints());
+      } else {
+        label.vitalsEl.style.display = 'none';
+      }
+
       if (this._pool.getHeadWorldPosition(pid, this._headScratch)) {
         label.object.position.copy(this._headScratch);
         label.object.visible = true;
@@ -92,7 +140,6 @@ export class PersonLabels {
       }
     }
 
-    // Drop labels for ids no longer assigned or no longer visible.
     for (const [pid, label] of this._labels) {
       if (!seen.has(pid)) {
         this._scene.remove(label.object);
@@ -105,6 +152,37 @@ export class PersonLabels {
         }
       }
     }
+  }
+
+  _maybeSampleHr(vitals) {
+    const now = performance.now();
+    if (now - this._lastSparkSampleMs < SPARK_SAMPLE_INTERVAL_MS) return;
+    this._lastSparkSampleMs = now;
+    const hr = vitals?.heart_rate_bpm;
+    const sample = (typeof hr === 'number' && hr > 0) ? hr : null;
+    this._hrSeries.push(sample);
+    if (this._hrSeries.length > SPARK_CAPACITY) this._hrSeries.shift();
+  }
+
+  /** Build the SVG `points` attribute from the current HR ring buffer. */
+  _sparkPoints() {
+    const series = this._hrSeries;
+    if (series.length < 2) return '';
+    // Use a clinically reasonable HR window so the sparkline shape reads
+    // as "varying around resting" rather than autoscaling each frame.
+    const minHR = 50;
+    const maxHR = 130;
+    const dx = SPARK_WIDTH / (SPARK_CAPACITY - 1);
+    const parts = [];
+    for (let i = 0; i < series.length; i++) {
+      const v = series[i];
+      if (v == null) continue;
+      const x = (i + (SPARK_CAPACITY - series.length)) * dx;
+      const yNorm = (v - minHR) / (maxHR - minHR);
+      const y = SPARK_HEIGHT - Math.max(0, Math.min(1, yNorm)) * SPARK_HEIGHT;
+      parts.push(`${x.toFixed(1)},${y.toFixed(1)}`);
+    }
+    return parts.join(' ');
   }
 
   _allocateLetter(pid) {
@@ -134,13 +212,52 @@ export class PersonLabels {
     const poseEl = document.createElement('span');
     poseEl.className = 'person-label__pose';
 
+    // Single-person vitals card. Hidden by default; sync() reveals it when
+    // exactly one person is visible and updates HR/BR/arousal + sparkline.
+    const vitalsEl = document.createElement('div');
+    vitalsEl.className = 'person-label__vitals';
+
+    const hrRow  = document.createElement('div'); hrRow.className  = 'person-label__row';
+    const brRow  = document.createElement('div'); brRow.className  = 'person-label__row';
+    const arRow  = document.createElement('div'); arRow.className  = 'person-label__row';
+
+    hrRow.innerHTML = '<span>心率</span><b class="hr-num">--</b><span class="unit">BPM</span>';
+    brRow.innerHTML = '<span>呼吸</span><b class="br-num">--</b><span class="unit">次/分</span>';
+    arRow.innerHTML = '<span>激活度<sup class="experimental">实验</sup></span><b class="ar-num">--</b>';
+
+    // 10s heart-rate sparkline.
+    const sparkNs = 'http://www.w3.org/2000/svg';
+    const sparkEl = document.createElementNS(sparkNs, 'svg');
+    sparkEl.setAttribute('class', 'hr-sparkline');
+    sparkEl.setAttribute('viewBox', `0 0 ${SPARK_WIDTH} ${SPARK_HEIGHT}`);
+    sparkEl.setAttribute('width', String(SPARK_WIDTH));
+    sparkEl.setAttribute('height', String(SPARK_HEIGHT));
+    const polyEl = document.createElementNS(sparkNs, 'polyline');
+    polyEl.setAttribute('fill', 'none');
+    polyEl.setAttribute('stroke', 'currentColor');
+    polyEl.setAttribute('stroke-width', '1.4');
+    polyEl.setAttribute('points', '');
+    sparkEl.appendChild(polyEl);
+
+    vitalsEl.appendChild(hrRow);
+    vitalsEl.appendChild(brRow);
+    vitalsEl.appendChild(arRow);
+    vitalsEl.appendChild(sparkEl);
+
     divEl.appendChild(letterEl);
     divEl.appendChild(poseEl);
+    divEl.appendChild(vitalsEl);
 
     const object = new CSS2DObject(divEl);
     this._scene.add(object);
 
-    return { object, divEl, letterEl, poseEl };
+    return {
+      object, divEl, letterEl, poseEl, vitalsEl,
+      hrEl: hrRow.querySelector('.hr-num'),
+      brEl: brRow.querySelector('.br-num'),
+      arousalEl: arRow.querySelector('.ar-num'),
+      polyEl,
+    };
   }
 
   dispose() {
