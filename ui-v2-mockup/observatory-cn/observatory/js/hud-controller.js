@@ -26,9 +26,10 @@ export const DEFAULTS = {
   field: 0.45, waves: 0.4, ambient: 0.7, reflect: 0.2,
   fov: 50, orbitSpeed: 0.15, grid: true, room: true,
   scenario: 'single_breathing', cycle: 30, dataSource: 'ws', wsUrl: 'ws://192.168.1.119:3001/ws/sensing',
+  cameraMode: 'diablo',
 };
 
-export const SETTINGS_VERSION = '8';  // bump: 默认走 WS 真实数据 (ws://192.168.1.119:3001/ws/sensing) (2026-05-27 21:13)
+export const SETTINGS_VERSION = '9';  // bump: 加 cameraMode (默认 diablo 等距锁定) (2026-05-28)
 
 export const PRESETS = {
   foundation: {},
@@ -272,11 +273,23 @@ export class HudController {
       this.saveSettings();
     });
 
+    // Camera mode (diablo isometric vs. free orbit)
+    const camModeSel = document.getElementById('opt-camera-mode');
+    if (camModeSel) {
+      camModeSel.value = s.cameraMode || 'diablo';
+      camModeSel.addEventListener('change', (e) => {
+        s.cameraMode = e.target.value;
+        obs._applyCameraMode();
+        this.saveSettings();
+      });
+    }
+
     // Buttons
     document.getElementById('btn-reset-camera').addEventListener('click', () => {
+      // Default angle, then let the current camera mode snap distance/polar.
       obs._camera.position.set(6, 5, 8);
       obs._controls.target.set(0, 1.2, 0);
-      obs._controls.update();
+      obs._applyCameraMode();
     });
     document.getElementById('btn-export-settings').addEventListener('click', () => {
       const blob = new Blob([JSON.stringify(s, null, 2)], { type: 'application/json' });
@@ -367,6 +380,9 @@ export class HudController {
     obs._camera.updateProjectionMatrix();
     obs._demoData.setCycleDuration(obs.settings.cycle);
     obs._applyColors();
+    const camModeEl = document.getElementById('opt-camera-mode');
+    if (camModeEl) camModeEl.value = obs.settings.cameraMode || 'diablo';
+    obs._applyCameraMode();
   }
 
   // ============================================================

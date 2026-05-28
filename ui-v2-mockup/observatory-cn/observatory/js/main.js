@@ -33,6 +33,12 @@ const C = {
 
 // SCENARIO_NAMES, DEFAULTS, SETTINGS_VERSION, PRESETS imported from hud-controller.js
 
+// ---- Diablo isometric camera constants ----
+// Locked polar angle from the +Y axis (~52°, similar to Diablo / Hades / League).
+// Distance is locked so OrbitControls' wheel zoom becomes a no-op.
+const DIABLO_POLAR = 0.9;
+const DIABLO_DISTANCE = 12;
+
 // ---- Main Class ----
 
 class Observatory {
@@ -81,11 +87,11 @@ class Observatory {
     this._controls = new OrbitControls(this._camera, this._canvas);
     this._controls.enableDamping = true;
     this._controls.dampingFactor = 0.08;
-    this._controls.minDistance = 2;
-    this._controls.maxDistance = 25;
-    this._controls.maxPolarAngle = Math.PI * 0.88;
     this._controls.target.set(0, 1.2, 0);
-    this._controls.update();
+    // Camera mode (diablo isometric lock vs. free orbit) is applied below
+    // after _controls exists. It sets min/maxDistance, polar bounds, and
+    // re-places the camera if the mode requires it.
+    this._applyCameraMode();
 
     this._clock = new THREE.Clock();
 
@@ -433,6 +439,47 @@ class Observatory {
     this._mistPoints.material.uniforms.uColor.value.copy(wc);
   }
 
+  /**
+   * Reconfigure OrbitControls + camera position for the current camera mode.
+   * - 'diablo': locks polar angle and distance so the view stays isometric;
+   *   drag still rotates azimuth around the target.
+   * - 'orbit':  original free-orbit behavior.
+   * Called from the constructor, the settings dropdown, and the
+   * "重置摄像机" button.
+   */
+  _applyCameraMode() {
+    const controls = this._controls;
+    const target = controls.target;
+    const mode = this.settings.cameraMode || 'diablo';
+
+    if (mode === 'diablo') {
+      controls.minPolarAngle = DIABLO_POLAR;
+      controls.maxPolarAngle = DIABLO_POLAR;
+      controls.minDistance = DIABLO_DISTANCE;
+      controls.maxDistance = DIABLO_DISTANCE;
+      controls.enablePan = false;
+
+      // Preserve current azimuth (so toggling mode while looking from a
+      // particular side doesn't visually teleport), but snap polar+distance.
+      const offset = this._camera.position.clone().sub(target);
+      const azim = Math.atan2(offset.x, offset.z);
+      const horiz = DIABLO_DISTANCE * Math.sin(DIABLO_POLAR);
+      const vert = DIABLO_DISTANCE * Math.cos(DIABLO_POLAR);
+      this._camera.position.set(
+        target.x + horiz * Math.sin(azim),
+        target.y + vert,
+        target.z + horiz * Math.cos(azim),
+      );
+    } else {
+      controls.minPolarAngle = 0;
+      controls.maxPolarAngle = Math.PI * 0.88;
+      controls.minDistance = 2;
+      controls.maxDistance = 25;
+      controls.enablePan = true;
+    }
+    controls.update();
+  }
+
   // ---- WebSocket live data ----
 
   _autoDetectLive() {
@@ -528,16 +575,27 @@ class Observatory {
     this._routerLed.material.opacity = 0.5 + 0.5 * Math.sin(elapsed * 8);
     this._routerLight.intensity = 0.3 + 0.2 * Math.sin(elapsed * 3);
 
-    // Autopilot orbit
+    // Autopilot orbit — in Diablo mode, just spin azimuth at the locked
+    // polar/distance so the lock isn't fighting an animated Y.
     if (this._autopilot) {
       this._autoAngle += dt * this.settings.orbitSpeed;
-      const r = 10;
-      this._camera.position.set(
-        Math.sin(this._autoAngle) * r,
-        4.5 + Math.sin(this._autoAngle * 0.5),
-        Math.cos(this._autoAngle) * r
-      );
       this._controls.target.set(0, 1.2, 0);
+      if ((this.settings.cameraMode || 'diablo') === 'diablo') {
+        const horiz = DIABLO_DISTANCE * Math.sin(DIABLO_POLAR);
+        const vert = DIABLO_DISTANCE * Math.cos(DIABLO_POLAR);
+        this._camera.position.set(
+          Math.sin(this._autoAngle) * horiz,
+          1.2 + vert,
+          Math.cos(this._autoAngle) * horiz,
+        );
+      } else {
+        const r = 10;
+        this._camera.position.set(
+          Math.sin(this._autoAngle) * r,
+          4.5 + Math.sin(this._autoAngle * 0.5),
+          Math.cos(this._autoAngle) * r,
+        );
+      }
       this._controls.update();
     }
     this._controls.update();
