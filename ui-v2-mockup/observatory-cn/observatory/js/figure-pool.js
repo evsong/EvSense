@@ -114,12 +114,13 @@ const _vecTo = new THREE.Vector3();
 const _vecTarget = new THREE.Vector3();
 
 // ---- Particle cloud config -------------------------------------------
-// We draw ~320 particles per figure: a Gaussian puff around each joint
-// plus a few particles linearly interpolated along each bone, so the
-// body reads as a soft point cloud rather than a solid glowing capsule.
-const PARTICLES_PER_JOINT = 10;
-const PARTICLES_PER_BONE = 9;
-const PARTICLES_TOTAL = 17 * PARTICLES_PER_JOINT + 16 * PARTICLES_PER_BONE; // 170 + 144 = 314
+// ~1160 particles per figure (was 314): denser cloud so the body reads as
+// a continuous volume from the locked Diablo isometric view rather than
+// a sparse halo. 4 figures * 1160 = 4640 total points — within budget on
+// desktop / Pi 4, can be downgraded if profiling shows a hit.
+const PARTICLES_PER_JOINT = 40;
+const PARTICLES_PER_BONE = 30;
+const PARTICLES_TOTAL = 17 * PARTICLES_PER_JOINT + 16 * PARTICLES_PER_BONE; // 680 + 480 = 1160
 
 // Per-joint sigma in world units (Three.js scene scale; person ~1.7m tall)
 const JOINT_SIGMA = [
@@ -130,6 +131,34 @@ const JOINT_SIGMA = [
   0.10, 0.10,                     // hips
   0.07, 0.07, 0.05, 0.05,         // knees, ankles
 ];
+
+// Chest-band joints that get an extra heart-rate-driven sigma pulse.
+// Visually: the torso "breathes" with the heartbeat, distinguishing
+// chest activity from limbs and signalling vitals at a glance.
+const CHEST_JOINTS = new Set([5, 6, 11, 12]);
+
+// State alert colors (override the user-chosen wireColor when triggered).
+const STATE_COLOR_RED   = 0xff3040; // critical: fallen / HR > 140
+const STATE_COLOR_AMBER = 0xffb020; // warning:  HR > 110 / abnormal BR
+
+/**
+ * Resolve the effective particle color for a person from pose + vitals.
+ * Writes into `out` (a THREE.Color) and returns it.
+ * Severity order: fallen > HR critical > HR warning > BR abnormal > base.
+ */
+function _stateTintColor(vitals, pose, baseColor, out) {
+  if (pose === 'fallen' || pose === 'falling') {
+    return out.setHex(STATE_COLOR_RED);
+  }
+  const hr = vitals?.heart_rate_bpm;
+  const br = vitals?.breathing_rate_bpm;
+  if (typeof hr === 'number' && hr > 140) return out.setHex(STATE_COLOR_RED);
+  if (typeof hr === 'number' && hr > 110) return out.setHex(STATE_COLOR_AMBER);
+  if (typeof br === 'number' && (br > 25 || (br > 0 && br < 8))) {
+    return out.setHex(STATE_COLOR_AMBER);
+  }
+  return out.copy(baseColor);
+}
 
 function _gauss() {
   let u = 0, v = 0;
@@ -309,6 +338,10 @@ export class FigurePool {
       velocities.push(new THREE.Vector3(0, 0, 0));
     }
 
+    // Scratch THREE.Color used per-frame to compute state tint without
+    // allocating; one per figure so multi-person figures don't stomp it.
+    const tintScratch = new THREE.Color();
+
     return {
       group, joints, bones, bodySegments, aura, auraMat, personLight,
       particles, particleMat, particlePos,
@@ -317,19 +350,43 @@ export class FigurePool {
       velocities,
       _initialized: false,
       _lastPose: null,
+      // Decays toward 0 each frame; spikes to 1.0 on transition into
+      // 'fallen'/'falling' so particles visibly explode outward at the
+      // moment a fall is detected.
+      _scatterBurst: 0,
+      _tintScratch: tintScratch,
     };
   }
 
-  /** Sample N particles per joint (Gaussian) + N per bone (interpolated). */
-  _updateParticles(fig, breathPulse) {
+  /**
+   * Sample N particles per joint (Gaussian) + N per bone (interpolated).
+   *
+   * @param {object} fig         Figure object
+   * @param {number} breathPulse Signed breath wave in [-~0.012, 0.012]
+   * @param {number} hrPulse     Signed heart wave in [-1, 1] (0 if no HR)
+   *                             Only modulates CHEST_JOINTS so the limbs
+   *                             stay calm — the chest visibly throbs.
+   */
+  _updateParticles(fig, breathPulse, hrPulse) {
     const arr = fig.particlePos;
     const breathScale = 1 + Math.abs(breathPulse) * 4;
+    // Scatter burst (1.0 on fall transition, decaying ~0.92/frame). Doubles
+    // the per-joint sigma at the moment of impact so the figure visibly
+    // explodes outward before settling.
+    const burstScale = 1 + fig._scatterBurst;
+    fig._scatterBurst *= 0.92;
+    if (fig._scatterBurst < 0.01) fig._scatterBurst = 0;
+
     let w = 0;
 
     // Per-joint gaussian clouds
     for (let i = 0; i < 17; i++) {
       const jp = fig.joints[i].position;
-      const sigma = JOINT_SIGMA[i] * breathScale;
+      let sigma = JOINT_SIGMA[i] * breathScale * burstScale;
+      // Chest band gets an extra HR-driven puff; limbs stay quiet.
+      if (CHEST_JOINTS.has(i)) {
+        sigma *= 1 + 0.3 * Math.abs(hrPulse);
+      }
       for (let p = 0; p < PARTICLES_PER_JOINT; p++) {
         arr[w++] = jp.x + _gauss() * sigma;
         arr[w++] = jp.y + _gauss() * sigma;
@@ -337,10 +394,10 @@ export class FigurePool {
       }
     }
     // Per-bone interpolated particles (jittered)
+    const jitter = 0.03 * burstScale;
     for (const bone of fig.bones) {
       const a = fig.joints[bone.a].position;
       const b = fig.joints[bone.b].position;
-      const jitter = 0.03;
       for (let p = 0; p < PARTICLES_PER_BONE; p++) {
         const t = (p + 0.5) / PARTICLES_PER_BONE;
         arr[w++] = a.x + (b.x - a.x) * t + _gauss() * jitter;
@@ -369,13 +426,20 @@ export class FigurePool {
     const breathPulse = breathBpm > 0
       ? Math.sin(elapsed * Math.PI * 2 * (breathBpm / 60)) * 0.012
       : 0;
+    // Unsigned heartbeat wave in [-1,1]; chest-joint sigma uses |hrPulse|.
+    const hrBpm = vs.heart_rate_bpm || 0;
+    const hrPulse = hrBpm > 0
+      ? Math.sin(elapsed * Math.PI * 2 * (hrBpm / 60))
+      : 0;
 
     for (let f = 0; f < this._figures.length; f++) {
       const fig = this._figures[f];
       if (f < persons.length && isPresent) {
         const p = persons[f];
         const kps = this._poseSystem.generateKeypoints(p, elapsed, breathPulse);
-        this.applyKeypoints(fig, kps, breathPulse, p.position || [0, 0, 0], elapsed, p.pose);
+        this.applyKeypoints(
+          fig, kps, breathPulse, p.position || [0, 0, 0], elapsed, p.pose, vs, hrPulse,
+        );
         fig.visible = true;
       } else {
         if (fig.visible) {
@@ -395,8 +459,27 @@ export class FigurePool {
    * @param {number} elapsed - Elapsed time for pulsation effects
    * @param {string} pose - Current pose name for aura adaptation
    */
-  applyKeypoints(fig, kps, breathPulse, pos, elapsed = 0, pose = 'standing') {
+  applyKeypoints(fig, kps, breathPulse, pos, elapsed = 0, pose = 'standing', vitals = null, hrPulse = 0) {
     const lerpFactor = fig._initialized ? 0.18 : 1.0;
+
+    // Fall transition: arm the scatter burst exactly when the pose first
+    // becomes 'fallen'/'falling'. The burst then decays inside _updateParticles.
+    const isFallPose = pose === 'fallen' || pose === 'falling';
+    const wasFallPose = fig._lastPose === 'fallen' || fig._lastPose === 'falling';
+    if (isFallPose && !wasFallPose) {
+      fig._scatterBurst = 1.0;
+    }
+
+    // State tint (red / amber / base) — overrides the user's chosen
+    // wireColor for the particle cloud only, leaving joints/bones in the
+    // theme color so the alert reads as "the *cloud* is in alert state".
+    const baseColor = fig.particleMat.color; // current color is the safe fallback
+    // We need the base wireColor independently of any prior tint we wrote.
+    // Read it fresh from settings each frame so color picker changes apply.
+    const settingsBase = (this._settingsBaseColor ||= new THREE.Color())
+      .set(this._settings.wireColor);
+    _stateTintColor(vitals, pose, settingsBase, fig._tintScratch);
+    baseColor.copy(fig._tintScratch);
 
     // Joints with smooth interpolation and secondary motion
     for (let i = 0; i < 17 && i < kps.length; i++) {
@@ -496,7 +579,7 @@ export class FigurePool {
     }
 
     // Particle cloud — soft glowing puff around joints + along bones
-    this._updateParticles(fig, breathPulse);
+    this._updateParticles(fig, breathPulse, hrPulse);
 
     // Aura — adapt shape to pose
     const hipY = (fig.joints[11].position.y + fig.joints[12].position.y) / 2;
